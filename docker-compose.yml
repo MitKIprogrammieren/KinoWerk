@@ -1,0 +1,17 @@
+# Kinowerk – Medien-Player (übernommen aus Ernsthafte Mediathek 0.8.9) mit Jellyfin-Schnittstelle für Plezy
+services:
+  kinowerk:
+    build: .
+    image: kinowerk:lokal
+    container_name: kinowerk
+    restart: unless-stopped
+    # host: damit Plezy Kinowerk im Heimnetz von selbst findet (UDP 7359) und DLNA-Fernseher gefunden werden
+    network_mode: host
+    environment:
+      - TZ=Europe/Berlin
+      - PORT=8088
+    volumes:
+      - ./daten:/data
+      - /mnt/medien:/media:ro        # Filme, Serien, Musik von der Synology (nur lesend)
+    devices:
+      - /dev/dri:/dev/dri            # Intel-Grafik des NUC für schnelles Umwandeln

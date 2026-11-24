@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Kinowerk">
+<title>Kinowerk</title>
+<link rel="manifest" href="/web/manifest.json">
+<link rel="icon" href="/web/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/web/icon-180.png">
+<link rel="stylesheet" href="/web/style.css?v=20">
+</head>
+<body>
+<header id="top" hidden>
+  <a href="#/" class="logo f" tabindex="0"><span class="logo-mark">▶</span> Kinowerk <span id="appver" class="appver"></span></a>
+  <nav id="nav"></nav>
+  <div class="top-right">
+    <a href="#/suche" class="f iconbtn" tabindex="0" title="Suche">⌕</a>
+    <a href="#/konto" class="f iconbtn" tabindex="0" title="Mein Konto">👤</a>
+    <a href="#/einstellungen" id="nav-settings" class="f iconbtn" tabindex="0" title="Einstellungen" hidden>⚙</a>
+    <button id="logout" class="f iconbtn" title="Abmelden">⏻</button>
+  </div>
+</header>
+<main id="view"></main>
+
+<div id="player" hidden>
+  <video id="video" playsinline webkit-playsinline x-webkit-airplay="allow" autopictureinpicture preload="auto"></video>
+  <div id="p-spinner" class="spinner" hidden></div>
+  <div id="p-scrub" class="p-scrub"><img alt=""><div class="r-flash on" id="p-flash"></div></div>
+  <div id="p-ui">
+    <div class="p-top">
+      <button id="p-close" class="pbtn f" title="Zurück">←</button>
+      <div class="p-title"><div id="p-title"></div><div id="p-sub"></div></div>
+    </div>
+    <div class="p-center">
+      <button id="p-chprev" class="pbtn big f" title="Kapitel zurück">⏮</button>
+      <button id="p-back" class="pbtn big f" title="10 s zurück">↺10</button>
+      <button id="p-play" class="pbtn huge f" title="Abspielen/Pause">❚❚</button>
+      <button id="p-fwd" class="pbtn big f" title="30 s vor">30↻</button>
+      <button id="p-chnext" class="pbtn big f" title="Kapitel vor">⏭</button>
+    </div>
+    <div class="p-bottom">
+      <div class="p-bar"><span id="p-cur">0:00</span>
+        <div id="p-seek" class="seek f" tabindex="0"><div id="p-buf"></div><div id="p-fill"></div><div id="p-marks"></div><div id="p-knob"></div><div id="p-hover"></div></div>
+        <span id="p-dur">0:00</span></div>
+      <div class="p-tools">
+        <select id="p-audio" class="f" title="Tonspur"></select>
+        <select id="p-quality" class="f" title="Qualität">
+          <option value="original">Original</option>
+          <option value="hoch">Hoch (1080p)</option>
+          <option value="mittel">Mittel (720p)</option>
+          <option value="niedrig">Niedrig (480p)</option>
+        </select>
+        <button id="p-next" class="pbtn f" hidden>Nächste Folge ⏭</button>
+        <span id="p-chapter" class="p-chapter"></span>
+        <span id="p-info" class="p-info"></span>
+        <button id="p-airplay" class="pbtn f" title="AirPlay" hidden>AirPlay ⇪</button>
+        <button id="p-cast" class="pbtn f" title="Auf Fernseher abspielen">📺 TV</button>
+        <button id="p-pip" class="pbtn f" title="Bild-in-Bild (kleines Fenster)" hidden>⧉</button>
+        <button id="p-fs" class="pbtn f" title="Vollbild">⛶</button>
+      </div>
+    </div>
+  </div>
+  <div id="p-nextbox" hidden><div><b>Folge zu Ende.</b> Als Nächstes:</div><div id="p-nexttitle"></div>
+    <div class="row"><button id="p-nextnow" class="btn primary f">▶ Nächste Folge</button><button id="p-nextcancel" class="btn f">Hier bleiben</button></div>
+    <div class="small muted" style="margin-top:8px">Eingeschlafen? Einfach zurückspulen und weiterschauen.</div></div>
+</div>
+
+<div id="remote" hidden>
+  <div class="r-bg" id="r-bg"></div>
+  <div class="r-inner">
+    <div class="r-top"><button class="pbtn f" id="r-close" title="Schließen (läuft weiter)">⌄</button>
+      <div class="r-dev" id="r-dev">📺</div><button class="pbtn f" id="r-stop" title="Wiedergabe beenden">■ Beenden</button></div>
+    <div class="r-cover" id="r-cover"><div class="r-hint">← zurück · zum Spulen wischen · vor →</div><div class="r-flash" id="r-flash"></div></div>
+    <div class="r-title" id="r-title"></div><div class="r-sub" id="r-sub"></div>
+    <div class="p-bar r-bar"><span id="r-cur">0:00</span>
+      <div id="r-seek" class="seek f" tabindex="0"><div id="r-fill" class="fill"></div><div id="r-marks"></div><div id="r-knob" class="knob"></div></div>
+      <span id="r-dur">0:00</span></div>
+    <div class="r-btns">
+      <button class="pbtn big f" id="r-chprev" title="Kapitel zurück">⏮</button>
+      <button class="pbtn big f" id="r-back">↺10</button>
+      <button class="pbtn huge f" id="r-play">❚❚</button>
+      <button class="pbtn big f" id="r-fwd">30↻</button>
+      <button class="pbtn big f" id="r-chnext" title="Kapitel vor">⏭</button>
+    </div>
+    <div class="r-vol"><button class="pbtn f" id="r-voldn">🔉 −</button><span id="r-volv">–</span><button class="pbtn f" id="r-volup">🔊 +</button></div>
+    <div class="r-more"><button class="btn f" id="r-here">Auf diesem Gerät weiterschauen</button><button class="btn primary f" id="r-next" hidden>Nächste Folge ⏭</button></div>
+    <div class="r-state muted small" id="r-state"></div>
+  </div>
+</div>
+<div id="castbar" hidden><span id="cb-text">📺</span><button class="pbtn f" id="cb-play">❚❚</button><button class="btn sm primary f" id="cb-open">Fernbedienung</button></div>
+
+<div id="modal" hidden><div class="modal-box"><div id="modal-body"></div></div></div>
+<div id="toast" hidden></div>
+
+<script>
+/* Fehler nicht sofort anzeigen: erst wenn nach 3 Sekunden immer noch nichts geladen ist */
+window.__errs = [];
+window.onerror = function (msg, src, line) {
+  window.__errs.push(String(msg) + (src ? " (" + String(src).split("/").pop() + ":" + line + ")" : ""));
+  setTimeout(function () {
+    var v = document.getElementById("view");
+    if (v && !v.querySelector("[data-loaded]") && !v.querySelector("form") && window.__errs.length) {
+      v.innerHTML = '<div style="padding:30px;color:#e5484d">Fehler in der Oberfläche:<br>' + window.__errs.join("<br>").replace(/</g, "&lt;") + '</div>';
+    }
+  }, 3000);
+};
+</script>
+<script src="/web/polyfills.js?v=20"></script>
+<script src="/web/hls.min.js"></script>
+<script src="/web/app.js?v=20"></script>
+</body>
+</html>
