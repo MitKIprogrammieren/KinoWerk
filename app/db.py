@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS items (
 );
 CREATE INDEX IF NOT EXISTS idx_items_lib ON items(library_id);
 CREATE INDEX IF NOT EXISTS idx_items_series ON items(series_id);
+CREATE TABLE IF NOT EXISTS tracks (
+    id INTEGER PRIMARY KEY, library_id INTEGER NOT NULL, path TEXT UNIQUE NOT NULL, folder TEXT,
+    title TEXT, artist TEXT, album TEXT, album_artist TEXT, track INTEGER, disc INTEGER, year INTEGER,
+    genre TEXT, duration REAL, codec TEXT, size INTEGER, mtime REAL, cover TEXT, added REAL
+);
+CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(library_id, album_artist, album);
+CREATE TABLE IF NOT EXISTS artist_img (name TEXT PRIMARY KEY, image TEXT, tried REAL, blocked INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS album_net (library_id INTEGER, afolder TEXT, tried REAL, blocked INTEGER DEFAULT 0, PRIMARY KEY(library_id, afolder));
+CREATE TABLE IF NOT EXISTS playlists (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT NOT NULL, created REAL);
+CREATE TABLE IF NOT EXISTS playlist_items (id INTEGER PRIMARY KEY, playlist_id INTEGER NOT NULL, track_id INTEGER NOT NULL, pos INTEGER);
+CREATE INDEX IF NOT EXISTS idx_pli ON playlist_items(playlist_id, pos);
 CREATE TABLE IF NOT EXISTS library_paths (
     id INTEGER PRIMARY KEY, library_id INTEGER NOT NULL, path TEXT NOT NULL,
     UNIQUE(library_id, path)
@@ -86,6 +97,11 @@ NEW_COLUMNS = [
     ("series", "genres", "TEXT"),
     ("users", "max_fsk", "INTEGER"), ("users", "allow_sat", "INTEGER DEFAULT 1"), ("users", "prefs", "TEXT"), ("users", "need_device", "INTEGER DEFAULT 0"),
     ("sessions", "device_id", "INTEGER"),
+    ("libraries", "admin_only", "INTEGER DEFAULT 0"), ("libraries", "nav_end", "INTEGER DEFAULT 0"),
+    ("tracks", "gnorm", "TEXT"), ("tracks", "cat", "TEXT"), ("tracks", "afolder", "TEXT"),
+    ("items", "orig_title", "TEXT"), ("items", "ok_check", "INTEGER DEFAULT 0"),
+    ("items", "part", "INTEGER"), ("items", "pgroup", "TEXT"), ("items", "meta_src", "TEXT"),
+    ("series", "tmdb_name", "TEXT"), ("series", "orig_name", "TEXT"), ("series", "ok_check", "INTEGER DEFAULT 0"),
 ]
 
 

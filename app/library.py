@@ -15,9 +15,10 @@ log = logging.getLogger("mediathek.library")
 
 VIDEO_EXT = {".mp4", ".m4v", ".mkv", ".avi", ".mov", ".wmv", ".mpg", ".mpeg", ".ts",
              ".m2ts", ".mts", ".webm", ".flv", ".divx", ".3gp", ".ogv"}
-SKIP_DIRS = {"#recycle", "@eaDir", "#snapshot", "@Recycle", "$RECYCLE.BIN", "lost+found",
+SKIP_DIRS = {"_Mediathek-Sicherung", "#recycle", "@eaDir", "#snapshot", "@Recycle", "$RECYCLE.BIN", "lost+found",
              "System Volume Information", "VIDEO_TS", "BDMV", "AUDIO_TS", "extras", "Extras",
-             "featurettes", "Featurettes", "sample", "Sample"}
+             "featurettes", "Featurettes", "sample", "Sample", "_Papierkorb"}
+TRASH_DIR = "_Papierkorb"
 JUNK = re.compile(
     r"\b(2160p|1080p|1080i|720p|576p|480p|4k|uhd|hdr10?|dv|bluray|blu-ray|bdrip|brrip|"
     r"dvdrip|webrip|web-dl|webdl|web|hdtv|remux|x264|x265|h264|h265|hevc|avc|xvid|divx|"
@@ -47,6 +48,25 @@ def clean_title(name: str):
     t = re.sub(r"\s+-\s*$", "", t)
     t = re.sub(r"\s{2,}", " ", t).strip(" -")
     return (t or name), year
+
+
+PART_RX = re.compile(r"[\s._\-(\[]*\b(?:teil|part|pt|cd|disc|disk)[\s._-]*(\d{1,2})\b[\)\]]?", re.I)
+
+
+def split_part(base: str):
+    """„Der Herr der Ringe - Die Gefährten SEE-Teil1 (2001)“ → („Der Herr der Ringe - Die Gefährten SEE (2001)“, 1)."""
+    ms = list(PART_RX.finditer(base))
+    if not ms:
+        return base, None
+    m = ms[-1]
+    rest = (base[:m.start()] + " " + base[m.end():]).strip(" -._")
+    rest = re.sub(r"[\s\-]+SEE\b", "", rest)          # „SEE“ = Special Extended Edition
+    return re.sub(r"\s{2,}", " ", rest), int(m.group(1))
+
+
+def part_group(base: str) -> str:
+    t, _ = clean_title(split_part(base)[0])
+    return re.sub(r"[^a-z0-9äöüß]+", "", t.lower())
 
 
 def sort_key(title: str) -> str:
@@ -119,12 +139,22 @@ def _scan_worker():
                 status["target"] = ", ".join(names)
             for lib, dirs in todo:
                 try:
+                    if lib["kind"] == "musik":
+                        status["phase"] = "Musik einlesen"
+                        from . import music
+                        music.scan(lib, status)
+                        continue
                     scan_library(lib, dirs)
                 except Exception:
                     log.exception("Scan von %s fehlgeschlagen", lib["name"])
             new = status["new"]
             probe_pending()
             fetch_metadata()
+            apply_vsmeta()
+            fill_titles()
+            if any(l_["kind"] == "musik" for l_, _ in todo):
+                from . import music
+                threading.Thread(target=music.fetch_images, daemon=True).start()
             status["last"] = time.time()
             status["last_result"] = (f"{status['target']}: {status['checked']} Dateien geprüft, "
                                      f"{new} neu oder geändert")
@@ -201,10 +231,11 @@ def scan_library(lib, only_dirs=None):
                         c.execute("UPDATE series SET details_done=0 WHERE id=? AND tmdb_id IS NOT NULL", (info["series_id"],))
                     c.execute(
                         "INSERT INTO items(library_id,path,kind,title,sort_title,year,series_id,season,"
-                        "episode,size,mtime,added,folder) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        "episode,size,mtime,added,folder,part,pgroup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (lib["id"], full, info["kind"], info["title"], sort_key(info["title"]),
                          info.get("year"), info.get("series_id"), info.get("season"),
-                         info.get("episode"), st.st_size, st.st_mtime, time.time(), shown))
+                         info.get("episode"), st.st_size, st.st_mtime, time.time(), shown,
+                         info.get("part"), info.get("pgroup")))
                 status["done"] += 1
             c.commit()
     # Nur Einträge entfernen, deren Ordner erreichbar war (NAS kurz weg = nichts löschen)
@@ -245,8 +276,9 @@ def classify(lib, full, fn, folder):
     if lib["kind"] == "serien":
         return classify_episode(lib, base, folder)
     if lib["kind"] == "filme":
-        t, y = clean_title(base)
-        return {"kind": "movie", "title": t, "year": y}
+        b2, part = split_part(base)
+        t, y = clean_title(b2)
+        return {"kind": "movie", "title": t, "year": y, "part": part, "pgroup": part_group(base) if part else None}
     t = re.sub(r"[\._]", " ", base).strip()
     return {"kind": "video", "title": t}
 
@@ -312,6 +344,19 @@ def reclassify_library(lib):
 
 def migrate():
     """Einmalige Anpassungen nach einem Update."""
+    if int(db.get_setting("parts_version", "0")) < 1:      # mehrteilige Filme (Teil1, Teil2 …) erkennen
+        for it in db.q("SELECT i.* FROM items i JOIN libraries l ON l.id=i.library_id WHERE l.kind='filme'"):
+            base = os.path.splitext(os.path.basename(it["path"]))[0]
+            b2, part = split_part(base)
+            if not part:
+                continue
+            if it["locked"] or it["tmdb_id"]:
+                db.run("UPDATE items SET part=?, pgroup=? WHERE id=?", (part, part_group(base), it["id"]))
+            else:                                            # noch nicht gefunden → mit sauberem Titel neu suchen
+                t, y = clean_title(b2)
+                db.run("UPDATE items SET part=?, pgroup=?, title=?, sort_title=?, year=COALESCE(?, year), meta_done=0 "
+                       "WHERE id=?", (part, part_group(base), t, sort_key(t), y, it["id"]))
+        db.set_setting("parts_version", "1")
     if int(db.get_setting("classify_version", "1")) < 2:
         for lib in db.q("SELECT * FROM libraries WHERE kind='serien'"):
             reclassify_library(lib)
@@ -675,8 +720,27 @@ def media_details(item):
 def chapters(item):
     return media_details(item)[0]
 
+def _part_in_title(t, part):
+    roman = {1: "i", 2: "ii", 3: "iii", 4: "iv", 5: "v"}.get(part, "#")
+    return bool(re.search(rf"\b({part}|{roman})\b", (t or "").lower()))
+
+
 def match_movie(item_id, title, year, tmdb_id=None):
-    if tmdb_id:
+    it = db.q1("SELECT part FROM items WHERE id=?", (item_id,)) or {}
+    part = it.get("part")
+    res = None
+    if part and not tmdb_id:
+        # Gibt es den Teil als eigenen Film (z. B. „Harry Potter … Teil 1“)? Dann den nehmen, sonst den ganzen Film.
+        params = {"query": f"{title} Teil {part}"}
+        if year:
+            params["year"] = year
+        for r in ((_tmdb_get("/search/movie", params) or {}).get("results") or [])[:3]:
+            if _part_in_title(r.get("title"), part) or _part_in_title(r.get("original_title"), part):
+                res = r
+                break
+    if res:
+        pass
+    elif tmdb_id:
         res = _tmdb_get(f"/movie/{tmdb_id}", {})
     else:
         params = {"query": title}
@@ -693,11 +757,11 @@ def match_movie(item_id, title, year, tmdb_id=None):
         return False
     y = (res.get("release_date") or "")[:4]
     db.run("UPDATE items SET tmdb_id=?, title=?, sort_title=?, year=?, overview=?, poster=?, "
-           "backdrop=?, meta_done=1, details_done=0 WHERE id=?",
+           "backdrop=?, meta_done=1, details_done=0, orig_title=?, ok_check=0, meta_src=NULL WHERE id=?",
            (res["id"], res.get("title") or title, sort_key(res.get("title") or title),
             int(y) if y.isdigit() else year, res.get("overview"),
             _save_image(res.get("poster_path"), "w342"),
-            _save_image(res.get("backdrop_path"), "w1280"), item_id))
+            _save_image(res.get("backdrop_path"), "w1280"), res.get("original_title") or "", item_id))
     return True
 
 
@@ -715,19 +779,87 @@ def match_series(sid, name, year, tmdb_id=None):
         db.run("UPDATE series SET meta_done=1 WHERE id=?", (sid,))
         return False
     y = (res.get("first_air_date") or "")[:4]
-    db.run("UPDATE series SET tmdb_id=?, overview=?, poster=?, backdrop=?, year=?, meta_done=1, details_done=0 "
-           "WHERE id=?",
+    db.run("UPDATE series SET tmdb_id=?, overview=?, poster=?, backdrop=?, year=?, meta_done=1, details_done=0, "
+           "tmdb_name=?, orig_name=?, ok_check=0 WHERE id=?",
            (res["id"], res.get("overview"), _save_image(res.get("poster_path"), "w342"),
             _save_image(res.get("backdrop_path"), "w1280"),
-            int(y) if y.isdigit() else year, sid))
+            int(y) if y.isdigit() else year, res.get("name") or "", res.get("original_name") or "", sid))
     return True
 
 
+def tmdb_find(kind, src, ident):
+    """Film/Serie über eine ID finden: src = tmdb | imdb | tvdb. Links (z. B. imdb.com/title/tt…/) gehen auch."""
+    ident = (ident or "").strip()
+    tv = kind == "serie"
+    res, is_tv = None, tv
+    if src == "imdb":
+        m = re.search(r"tt\d{5,10}", ident)
+        if not m:
+            raise RuntimeError("IMDb-Nummer sieht aus wie tt0120737")
+        d = _tmdb_get(f"/find/{m.group(0)}", {"external_source": "imdb_id"}) or {}
+        lst = (d.get("tv_results") or []) + (d.get("movie_results") or []) if tv else (d.get("movie_results") or []) + (d.get("tv_results") or [])
+        if lst:
+            res = lst[0]
+            is_tv = res in (d.get("tv_results") or [])
+        elif d.get("tv_episode_results"):           # IMDb-Nummer einer einzelnen Serienfolge
+            ep = d["tv_episode_results"][0]
+            show = _tmdb_get(f"/tv/{ep['show_id']}", {}) or {}
+            return {"id": f"{ep['show_id']}/{ep.get('season_number')}/{ep.get('episode_number')}", "type": "episode", "tv": True,
+                    "title": f"{show.get('name', '')} – {ep.get('name', '')}".strip(" –"),
+                    "info": f"Staffel {ep.get('season_number')}, Folge {ep.get('episode_number')}",
+                    "year": (ep.get("air_date") or "")[:4],
+                    "poster": (IMG_BASE + "w154" + (show.get("poster_path") or ep.get("still_path"))) if (show.get("poster_path") or ep.get("still_path")) else None}
+    else:
+        m = re.search(r"\d+", ident)
+        if not m:
+            raise RuntimeError("Bitte die Nummer eingeben")
+        if src == "tvdb":
+            d = _tmdb_get(f"/find/{m.group(0)}", {"external_source": "tvdb_id"}) or {}
+            lst = (d.get("tv_results") or []) + (d.get("movie_results") or [])
+            if lst:
+                res = lst[0]
+                is_tv = res in (d.get("tv_results") or [])
+        else:
+            try:
+                res = _tmdb_get(("/tv/" if tv else "/movie/") + m.group(0), {})
+            except Exception:
+                res = None
+    if not res:
+        return None
+    return {"id": res["id"], "title": res.get("title") or res.get("name"), "tv": is_tv, "type": "tv" if is_tv else "movie",
+            "year": (res.get("release_date") or res.get("first_air_date") or "")[:4],
+            "poster": (IMG_BASE + "w154" + res["poster_path"]) if res.get("poster_path") else None}
+
+
+def external_ids(kind, tmdb_id):
+    if not tmdb_id:
+        return {}
+    try:
+        d = _tmdb_get(("/tv/" if kind == "series" else "/movie/") + f"{tmdb_id}/external_ids", {}) or {}
+    except Exception:
+        return {}
+    return {"imdb": d.get("imdb_id") or "", "tvdb": str(d.get("tvdb_id") or "")}
+
+
 def tmdb_search(kind, query):
+    """Suche von Hand. Ein Jahr im Suchtext („Titel (2007)“ oder „Titel 2007“) wird als Jahr benutzt:
+    Treffer aus diesem Jahr (±1) stehen oben; ohne Treffer wird ohne Jahr gesucht."""
     path = "/search/tv" if kind == "serie" else "/search/movie"
-    data = _tmdb_get(path, {"query": query}) or {}
+    q = query.strip()
+    year = None
+    m = re.search(r"[\(\[]?\b((?:19|20)\d{2})\b[\)\]]?\s*$", q)
+    if m and m.start() > 0:
+        year = int(m.group(1))
+        q = q[:m.start()].strip(" -.(")
+    data = _tmdb_get(path, {"query": q}) or {}
+    results = data.get("results") or []
+    if year:
+        def yr(r):
+            y = (r.get("release_date") or r.get("first_air_date") or "")[:4]
+            return int(y) if y.isdigit() else 0
+        results.sort(key=lambda r: 0 if abs(yr(r) - year) <= 1 else 1)   # stabil: TMDB-Reihenfolge bleibt sonst erhalten
     out = []
-    for r in (data.get("results") or [])[:10]:
+    for r in results[:10]:
         out.append({"id": r["id"], "title": r.get("title") or r.get("name"),
                     "year": (r.get("release_date") or r.get("first_air_date") or "")[:4],
                     "poster": (IMG_BASE + "w154" + r["poster_path"]) if r.get("poster_path") else None})
@@ -752,3 +884,151 @@ def thumbnail(item):
         if os.path.exists(dest) and os.path.getsize(dest) > 0:
             return dest
     return None
+
+
+# ---------------------------------------------------------------- Papierkorb
+
+def move_to_trash(item):
+    """Film/Folge in den Ordner _Papierkorb im Bibliotheksordner verschieben (Ordnerstruktur bleibt erhalten).
+    Liegt der Film allein in einem eigenen Ordner, wandert der ganze Ordner (mit Covern, Untertiteln usw.).
+    Endgültig gelöscht wird nichts – das macht der Admin selbst auf der NAS."""
+    lib = db.q1("SELECT * FROM libraries WHERE id=?", (item["library_id"],))
+    path = item["path"]
+    root, rel, _ = locate(roots(lib), path)
+    if not root:
+        raise RuntimeError("Datei liegt in keinem Bibliotheksordner")
+    if not os.path.exists(path):
+        raise RuntimeError("Datei nicht gefunden – evtl. schon verschoben")
+    if not os.access(os.path.dirname(path), os.W_OK):
+        raise RuntimeError("Der Filmordner ist nur lesend eingehängt – Löschen ist erst nach der Umstellung auf Lesen/Schreiben möglich")
+    trash = os.path.join(root, TRASH_DIR)
+    src_dir = os.path.dirname(path)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    others = [f for f in os.listdir(src_dir)
+              if os.path.splitext(f)[1].lower() in VIDEO_EXT and os.path.join(src_dir, f) != path]
+    moves = []
+    if rel and not others:
+        moves.append((src_dir, os.path.join(trash, rel)))           # ganzer Ordner
+    else:
+        dst_dir = os.path.join(trash, rel) if rel else trash
+        for f in os.listdir(src_dir):
+            fp = os.path.join(src_dir, f)
+            if os.path.isfile(fp) and (fp == path or f.startswith(stem + ".") or f.startswith(stem + "-")):
+                moves.append((fp, os.path.join(dst_dir, f)))
+    done = []
+
+    def _move(src, dst):
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.isdir(src) and os.path.isdir(dst):
+            for f in os.listdir(src):                  # Ordner gibt es im Papierkorb schon -> zusammenführen
+                _move(os.path.join(src, f), os.path.join(dst, f))
+            os.rmdir(src)
+            return
+        if os.path.exists(dst):
+            base, ext = os.path.splitext(dst)
+            dst = f"{base} ({time.strftime('%Y-%m-%d %H%M%S')}){ext}"
+        os.rename(src, dst)
+
+    for src, dst in moves:
+        _move(src, dst)
+        done.append(dst)
+    # leer gewordene Ordner bis zum Bibliotheksordner entfernen
+    d = src_dir if os.path.isdir(src_dir) else os.path.dirname(src_dir)
+    while d.startswith(root.rstrip("/") + "/") and os.path.isdir(d):
+        try:
+            if os.listdir(d):
+                break
+            os.rmdir(d)
+        except OSError:
+            break
+        d = os.path.dirname(d)
+    # Datenbank aufräumen
+    c = db.conn()
+    with c:
+        c.execute("DELETE FROM items WHERE id=?", (item["id"],))
+        c.execute("DELETE FROM progress WHERE item_id=?", (item["id"],))
+        for t in ("people", "tags", "recs"):
+            c.execute(f"DELETE FROM {t} WHERE ref_kind='item' AND ref_id=?", (item["id"],))
+        if item["series_id"]:
+            if not c.execute("SELECT 1 FROM items WHERE series_id=? LIMIT 1", (item["series_id"],)).fetchone():
+                c.execute("DELETE FROM series WHERE id=?", (item["series_id"],))
+                for t in ("people", "tags", "recs"):
+                    c.execute(f"DELETE FROM {t} WHERE ref_kind='series' AND ref_id=?", (item["series_id"],))
+    log.info("In den Papierkorb verschoben: %s -> %s", path, done)
+    return done
+
+
+def fill_titles():
+    """Für die Titelprüfung: Originaltitel bzw. TMDB-Seriennamen einmalig nachladen (ältere Einträge)."""
+    if not db.get_setting("tmdb_key"):
+        return
+    for m in db.q("SELECT id, tmdb_id FROM items WHERE kind='movie' AND tmdb_id IS NOT NULL AND orig_title IS NULL"):
+        try:
+            res = _tmdb_get(f"/movie/{m['tmdb_id']}", {}) or {}
+            db.run("UPDATE items SET orig_title=? WHERE tmdb_id=? AND orig_title IS NULL",
+                   (res.get("original_title") or res.get("title") or "", m["tmdb_id"]))
+        except Exception as e:
+            log.warning("Originaltitel %s: %s", m["tmdb_id"], e)
+            db.run("UPDATE items SET orig_title='' WHERE id=?", (m["id"],))
+        time.sleep(0.05)
+    for s_ in db.q("SELECT id, tmdb_id FROM series WHERE tmdb_id IS NOT NULL AND tmdb_name IS NULL"):
+        try:
+            res = _tmdb_get(f"/tv/{s_['tmdb_id']}", {}) or {}
+            db.run("UPDATE series SET tmdb_name=?, orig_name=? WHERE id=?",
+                   (res.get("name") or "", res.get("original_name") or "", s_["id"]))
+        except Exception as e:
+            log.warning("Serienname %s: %s", s_["tmdb_id"], e)
+            db.run("UPDATE series SET tmdb_name='' WHERE id=?", (s_["id"],))
+        time.sleep(0.05)
+
+
+def tmdb_tv_details(ident):
+    """Angaben einer Serie („123“) oder Serienfolge („123/5/24“) fürs Formular – z. B. wenn eine Miniserie
+    oder eine Doppelfolge als Film abgelegt ist."""
+    parts = str(ident).split("/")
+    sid = parts[0]
+    show = _tmdb_get(f"/tv/{sid}", {"append_to_response": "aggregate_credits,content_ratings"}) or {}
+    fsk = None
+    for r in (show.get("content_ratings") or {}).get("results") or []:
+        if r.get("iso_3166_1") == "DE" and str(r.get("rating", "")).isdigit():
+            fsk = int(r["rating"])
+    cast = [{"name": c["name"], "role": ((c.get("roles") or [{}])[0].get("character") or "")}
+            for c in ((show.get("aggregate_credits") or {}).get("cast") or [])[:25]]
+    out = {"title": show.get("name") or "", "year": int((show.get("first_air_date") or "0")[:4] or 0) or None,
+           "overview": show.get("overview") or "", "fsk": fsk,
+           "genres": [g["name"] for g in show.get("genres") or []],
+           "director": [c["name"] for c in show.get("created_by") or []],
+           "cast": cast,
+           "poster_url": (IMG_BASE + "w500" + show["poster_path"]) if show.get("poster_path") else None,
+           "source": "TheMovieDB (Serie)"}
+    if len(parts) == 3:
+        ep = _tmdb_get(f"/tv/{sid}/season/{parts[1]}/episode/{parts[2]}", {"append_to_response": "credits"}) or {}
+        guests = [{"name": g["name"], "role": g.get("character") or ""} for g in (ep.get("credits") or {}).get("guest_stars", [])[:15]]
+        out.update(title=f"{show.get('name', '')} – {ep.get('name', '')}".strip(" –"),
+                   year=int((ep.get("air_date") or "0")[:4] or 0) or out["year"],
+                   overview=ep.get("overview") or out["overview"],
+                   director=[c["name"] for c in ep.get("crew") or [] if c.get("job") == "Director"] or out["director"],
+                   cast=cast[:15] + guests, source="TheMovieDB (Serienfolge)")
+    return out
+
+
+def apply_vsmeta():
+    """Filme, zu denen TheMovieDB nichts gefunden hat: Infos aus der Video-Station-Datei (.vsmeta) bzw.
+    einem gleichnamigen Bild übernehmen. Jede Datei wird nur einmal geprüft."""
+    from . import vsmeta
+    done = "" if not db.get_setting("tmdb_key") else " AND meta_done=1"     # ohne TMDB-Schlüssel sofort
+    rows = db.q("SELECT * FROM items WHERE kind='movie' AND tmdb_id IS NULL AND locked=0 AND meta_src IS NULL" + done)
+    n = 0
+    for it in rows:
+        try:
+            ok = vsmeta.apply(it, _store_links)
+        except Exception as e:
+            log.warning("vsmeta %s: %s", it["path"], e)
+            ok = False
+        if ok:
+            n += 1
+        else:
+            db.run("UPDATE items SET meta_src='' WHERE id=?", (it["id"],))
+    if n:
+        log.info("Video-Station-Infos für %d Filme übernommen", n)
+    return n

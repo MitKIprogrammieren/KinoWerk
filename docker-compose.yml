@@ -1,4 +1,4 @@
-# Kinowerk – Medien-Player (übernommen aus Ernsthafte Mediathek 0.8.9) mit Jellyfin-Schnittstelle für Plezy
+# Kinowerk – Medien-Player (übernommen aus Ernsthafte Mediathek 0.15) mit Jellyfin-Schnittstelle für Plezy
 services:
   kinowerk:
     build: .

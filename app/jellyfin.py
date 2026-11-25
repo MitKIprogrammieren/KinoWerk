@@ -257,7 +257,8 @@ def libs_for(u):
     ids = M().allowed_libs(u)
     if not ids:
         return []
-    return db.q(f"SELECT * FROM libraries WHERE id IN ({','.join('?' * len(ids))}) ORDER BY sort, name", ids)
+    # Musik-Bibliotheken zeigt Plezy (noch) nicht an
+    return db.q(f"SELECT * FROM libraries WHERE id IN ({','.join('?' * len(ids))}) AND kind != 'musik' ORDER BY sort, name", ids)
 
 
 def lib_ctype(lib):

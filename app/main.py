@@ -1,4 +1,4 @@
-"""Kinowerk – eigener Videoserver (übernommen aus Ernsthafte Mediathek 0.8.9)."""
+"""Kinowerk – eigener Videoserver (übernommen aus Ernsthafte Mediathek 0.15)."""
 import asyncio
 import hashlib
 import json
@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 import ipaddress
 import zlib
 
-from . import cast, db, library, livetv, lookup, transcode
+from . import backup, check, cast, db, library, livetv, lookup, music, transcode, vsmeta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("mediathek")
@@ -27,7 +27,7 @@ WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 MEDIA_ROOT = os.environ.get("MEDIATHEK_MEDIA", "/media")
 COOKIE = "mt_session"
 SESSION_DAYS = 90
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_NAME = "Kinowerk"
 
 @asynccontextmanager
@@ -36,7 +36,10 @@ async def lifespan(_app):
     library.migrate()
     jellyfin.init()
     jellyfin.discovery_thread(int(os.environ.get("PORT", "8080")))
+    threading.Thread(target=lambda: (music.normalize_all(), time.sleep(30), music.fetch_images()), daemon=True).start()
+    threading.Thread(target=lambda: (library.apply_vsmeta(), library.fill_titles()), daemon=True).start()
     threading.Thread(target=transcode.reaper, daemon=True).start()
+    threading.Thread(target=backup.loop, daemon=True).start()
     threading.Thread(target=_auto_scan, daemon=True).start()
     yield
     for sid in list(transcode.sessions):
@@ -120,7 +123,7 @@ def admin_required(u: dict = Depends(user_required)) -> dict:
 
 
 def allowed_libs(u) -> list:
-    ids = [r["id"] for r in db.q("SELECT id FROM libraries")]
+    ids = [r["id"] for r in db.q("SELECT id, admin_only FROM libraries") if u["is_admin"] or not r["admin_only"]]
     if u["libraries"]:
         try:
             allowed = set(json.loads(u["libraries"]))
@@ -362,16 +365,60 @@ def _quality(it):
 
 
 def _group_key(it):
+    if it.get("kind") == "movie" and it.get("part") and it.get("_parts") is None and it.get("pgroup"):
+        return ("p", it["library_id"], it["pgroup"], it["part"])      # einzelner Teil ohne Gruppe in der Liste
     if it.get("kind") == "movie" and it.get("tmdb_id"):
-        return ("m", it["tmdb_id"])
+        return ("m", it["tmdb_id"], it.get("_parts") and 1)
     if it.get("kind") == "episode" and it.get("series_id") and it.get("episode") is not None:
         return ("e", it["series_id"], it.get("season"), it["episode"])
     return ("i", it["id"])
 
 
+def _pkey(it):
+    return (it["library_id"], os.path.dirname(it.get("path") or ""), it.get("pgroup"))
+
+
+def fold_parts(items):
+    """Mehrteilige Filme (Teil1, Teil2 …): nur Teil 1 zeigen, die übrigen Teile hängen daran.
+    Haben die Teile verschiedene Filminfos (eigene Filme wie „Harry Potter … Teil 1/2“), bleiben sie getrennt."""
+    groups = {}
+    for it in items:
+        if it.get("part") and it.get("pgroup"):
+            groups.setdefault(_pkey(it), []).append(it)
+    drop, extra = set(), {}
+    for k, g in groups.items():
+        if len(g) < 2 or len({x["tmdb_id"] for x in g if x.get("tmdb_id")}) > 1:
+            continue
+        g.sort(key=lambda x: x["part"])
+        head = g[0]
+        extra[head["id"]] = len({x["part"] for x in g})
+        drop.update(x["id"] for x in g[1:] if x["part"] != head["part"])
+    out = []
+    for it in items:
+        if it["id"] in drop:
+            continue
+        out.append(dict(it, _parts=extra[it["id"]]) if it["id"] in extra else it)
+    return out
+
+
+def part_list(it):
+    """Alle Teile zu einem Film (sortiert), oder [] wenn er nicht mehrteilig ist."""
+    if not (it.get("part") and it.get("pgroup")):
+        return []
+    rows = [r for r in db.q("SELECT id, part, duration, tmdb_id, path FROM items WHERE library_id=? AND pgroup=? AND part IS NOT NULL",
+                            (it["library_id"], it["pgroup"])) if os.path.dirname(r["path"]) == os.path.dirname(it["path"])]
+    if len(rows) < 2 or len({r["tmdb_id"] for r in rows if r["tmdb_id"]}) > 1:
+        return []
+    best = {}
+    for r in sorted(rows, key=lambda r: r["part"]):
+        best.setdefault(r["part"], r)
+    return [{"id": r["id"], "part": r["part"], "duration": r["duration"]} for r in best.values()]
+
+
 def collapse(items):
     """Mehrere Fassungen desselben Films / derselben Folge zu einem Eintrag (beste Qualität) zusammenfassen."""
     groups, order = {}, []
+    items = fold_parts(items)
     for it in items:
         k = _group_key(it)
         if k not in groups:
@@ -392,6 +439,8 @@ def siblings(it, u=None):
     """Alle Fassungen zu einem Eintrag (inkl. sich selbst)."""
     if it.get("kind") == "movie" and it.get("tmdb_id"):
         rows = db.q("SELECT * FROM items WHERE kind='movie' AND tmdb_id=?", (it["tmdb_id"],))
+        # Teile eines mehrteiligen Films sind keine Fassungen: nur gleiche Teilnummer (bzw. nur ungeteilte)
+        rows = [r for r in rows if (r.get("part") or None) == (it.get("part") or None)]
     elif it.get("kind") == "episode" and it.get("series_id") and it.get("episode") is not None:
         rows = db.q("SELECT * FROM items WHERE series_id=? AND season IS ? AND episode=?",
                     (it["series_id"], it.get("season"), it["episode"]))
@@ -415,7 +464,7 @@ def _card(it, prog=None):
             "series_name": it.get("series_name"), "added": it.get("added"),
             "sort": it.get("sort_title"), "fsk": it.get("fsk"), "src": source_of(it.get("path")),
             "versions": it.get("_versions", 1), "file": os.path.basename(it.get("path") or ""),
-            "folder": it.get("folder"), "height": it.get("height")}
+            "folder": it.get("folder"), "height": it.get("height"), "parts": it.get("_parts")}
 
 
 def _progress_map(uid, ids):
@@ -445,10 +494,22 @@ def libraries(u=Depends(user_required)):
     out = []
     for lib in db.q("SELECT * FROM libraries ORDER BY sort, name"):
         if lib["id"] in ids:
-            n = db.q1("SELECT COUNT(DISTINCT CASE WHEN kind='movie' AND tmdb_id IS NOT NULL THEN 'm'||tmdb_id "
-                      "ELSE 'i'||id END) n FROM items WHERE library_id=?", (lib["id"],))["n"]
-            out.append({"id": lib["id"], "name": lib["name"], "kind": lib["kind"], "count": n})
+            if lib["kind"] == "musik":
+                n = db.q1("SELECT COUNT(*) n FROM tracks WHERE library_id=?", (lib["id"],))["n"]
+            else:
+                n = db.q1("SELECT COUNT(DISTINCT CASE WHEN kind='movie' AND tmdb_id IS NOT NULL THEN 'm'||tmdb_id "
+                          "ELSE 'i'||id END) n FROM items WHERE library_id=?", (lib["id"],))["n"]
+            out.append({"id": lib["id"], "name": lib["name"], "kind": lib["kind"], "count": n, "nav_end": bool(lib["nav_end"])})
     return out
+
+
+@app.post("/api/admin/libraries/order")
+async def admin_lib_order(request: Request, u=Depends(admin_required)):
+    """Reihenfolge im Menü speichern (Liste der Bibliotheks-IDs von oben nach unten)."""
+    b = await request.json()
+    for i, lid in enumerate(b.get("ids") or []):
+        db.run("UPDATE libraries SET sort=? WHERE id=?", (i + 1, int(lid)))
+    return {"ok": True}
 
 
 @app.get("/api/home")
@@ -516,13 +577,20 @@ def library_view(lib_id: int, sort: str = "title", q: str = "", folder: Optional
                 args += [lib_id, folder, folder + "/%"]
         if sort == "seen":
             where += " AND seen IS NOT NULL"
+        if sort == "check":
+            sorder = "name COLLATE NOCASE"
         series = db.q(f"SELECT * FROM (SELECT *, (SELECT COUNT(*) FROM items WHERE series_id=series.id) n, "
                       f"(SELECT MAX(p.updated) FROM progress p JOIN items i ON i.id=p.item_id "
                       f" WHERE i.series_id=series.id AND p.user_id=?) seen FROM series) series "
                       f"WHERE {where} ORDER BY {sorder}", args)
-        return {"library": lib, "folders": groups, "series": [
-            {"id": s["id"], "title": s["name"], "year": s["year"], "poster": s["poster"],
-             "count": s["n"], "fsk": s["fsk"], "sort": library.sort_key(s["name"])} for s in series]}
+        adm = bool(u["is_admin"])
+        out = [{"id": s["id"], "title": s["name"], "year": s["year"], "poster": s["poster"],
+                "count": s["n"], "fsk": s["fsk"], "sort": library.sort_key(s["name"]),
+                "chk": check.series_flag(s) if adm else 0,
+                "tmdb_name": s.get("tmdb_name") if adm else None} for s in series]
+        if sort == "check":
+            out = [x for x in out if x["chk"]]
+        return {"library": lib, "folders": groups, "series": out}
     ifs, ifa = fsk_sql(u, "items", fsk)
     args = [u["id"], lib_id, *ifa]
     where = "library_id=?" + ifs
@@ -535,11 +603,23 @@ def library_view(lib_id: int, sort: str = "title", q: str = "", folder: Optional
     if sort == "seen":
         where += " AND seen IS NOT NULL"
         order = "seen DESC"
+    if sort == "check":
+        order = "sort_title COLLATE NOCASE"
     items = db.q(f"SELECT * FROM (SELECT items.*, (SELECT updated FROM progress p WHERE p.item_id=items.id AND p.user_id=?) seen "
                  f"FROM items) items WHERE {where} ORDER BY {order}", args)
     folders = [r["folder"] for r in db.q(
         "SELECT DISTINCT folder FROM items WHERE library_id=? AND folder<>'' ORDER BY folder", (lib_id,))]
-    return {"library": lib, "items": _cards(u["id"], items), "folders": folders}
+    cards = _cards(u["id"], items)
+    if u["is_admin"] and lib["kind"] == "filme":
+        byid = {it["id"]: it for it in items}
+        for c_ in cards:
+            it = byid.get(c_["id"]) or {}
+            c_["chk"] = check.movie_flag(it)
+            if c_["chk"] == 1:
+                c_["ftitle"] = (check.file_titles(it.get("path")) or [("", None)])[0][0]
+    if sort == "check":
+        cards = [c_ for c_ in cards if c_.get("chk")]
+    return {"library": lib, "items": cards, "folders": folders}
 
 
 @app.get("/api/series/{sid}")
@@ -557,6 +637,7 @@ def series_view(sid: int, u=Depends(user_required)):
     seasons = {}
     for c_ in _cards(u["id"], eps):
         seasons.setdefault(c_["season"] or 0, []).append(c_)
+    s["chk"] = check.series_flag(s) if u["is_admin"] else 0
     return {"series": s, "seasons": [{"season": k, "episodes": v} for k, v in sorted(seasons.items())]}
 
 
@@ -578,6 +659,11 @@ def item_view(item_id: int, u=Depends(user_required)):
                  (u["id"], *sib_ids)) or {}
     series = db.q1("SELECT * FROM series WHERE id=?", (it["series_id"],)) if it["series_id"] else None
     nxt = None
+    parts = part_list(it) if it["kind"] == "movie" else []
+    if parts:
+        later = [x for x in parts if x["part"] > (it["part"] or 0)]
+        if later:
+            nxt = {"id": later[0]["id"], "title": f"{it['title']} – Teil {later[0]['part']}", "part": later[0]["part"], "auto": True}
     if series:
         nxt = db.q1("SELECT id,title,season,episode FROM items WHERE series_id=? AND "
                     "(season>? OR (season=? AND episode>?)) ORDER BY season, episode LIMIT 1",
@@ -602,7 +688,54 @@ def item_view(item_id: int, u=Depends(user_required)):
         "mtime": it["mtime"], "added": it["added"],
         "cast": json.loads(it["cast"] or (series or {}).get("cast") or "null"),
         "genres": json.loads(it["genres"] or (series or {}).get("genres") or "[]"),
+        "chk": check.movie_flag(it) if u["is_admin"] else 0,
+        "parts": parts, "part": it.get("part") if parts else None,
+        "orig_title": it.get("orig_title"),
     }
+
+
+@app.post("/api/admin/music/trash")
+async def music_trash(request: Request, u=Depends(admin_required)):
+    b = await request.json()
+    ids = [int(x) for x in (b.get("ids") or [])]
+    album = bool(b.get("album"))
+    if album and ids:
+        a = music.album(ids[0], music_libs(u))
+        ids = [t["id"] for t in (a or {}).get("tracks", [])]
+    try:
+        n = await asyncio.to_thread(music.trash, ids, album)
+    except Exception as e:
+        raise HTTPException(409, str(e))
+    return {"ok": True, "moved": n}
+
+
+@app.post("/api/admin/music/images")
+async def music_images(request: Request, u=Depends(admin_required)):
+    b = await request.json()
+    act = b.get("action")
+    if act == "remove_artist":
+        music.remove_artist_photo(b.get("name") or "")
+    elif act == "remove_cover":
+        music.remove_album_cover(int(b.get("id") or 0))
+    elif act == "fetch":
+        threading.Thread(target=music.fetch_images, args=(bool(b.get("force")),), daemon=True).start()
+    return {"ok": True, "status": music.NET}
+
+
+@app.get("/api/admin/music/images")
+def music_images_status(u=Depends(admin_required)):
+    return music.NET
+
+
+@app.post("/api/admin/check_ok/{kind}/{oid}")
+def check_ok(kind: str, oid: int, u=Depends(admin_required)):
+    """„Passt so“ – Eintrag aus der Titelprüfung nehmen."""
+    if kind == "series":
+        db.run("UPDATE series SET ok_check=1 WHERE id=?", (oid,))
+    else:
+        it = db.q1("SELECT tmdb_id FROM items WHERE id=?", (oid,))
+        db.run("UPDATE items SET ok_check=1 WHERE id=?", (oid,))
+    return {"ok": True}
 
 
 @app.get("/api/search")
@@ -943,7 +1076,7 @@ def http_client():
     global _http
     if _http is None:
         _http = httpx.AsyncClient(timeout=20, follow_redirects=True,
-                                  headers={"User-Agent": "Mozilla/5.0 Kinowerk"})
+                                  headers={"User-Agent": "Mozilla/5.0 Mediathek"})
     return _http
 
 
@@ -1024,7 +1157,8 @@ async def admin_settings_save(request: Request, u=Depends(admin_required)):
 @app.get("/api/admin/libraries")
 def admin_libs(u=Depends(admin_required)):
     out = []
-    for l in db.q("SELECT l.*, (SELECT COUNT(*) FROM items WHERE library_id=l.id) n FROM libraries l "
+    for l in db.q("SELECT l.*, (SELECT COUNT(*) FROM items WHERE library_id=l.id) + "
+                  "(SELECT COUNT(*) FROM tracks WHERE library_id=l.id) n FROM libraries l "
                   "ORDER BY sort, name"):
         l["paths"] = library.roots(l)
         out.append(l)
@@ -1037,7 +1171,7 @@ async def admin_lib_save(request: Request, u=Depends(admin_required)):
     name, kind = (b.get("name") or "").strip(), b.get("kind")
     paths = [p.strip().rstrip("/") for p in (b.get("paths") or ([b["path"]] if b.get("path") else [])) if p.strip()]
     paths = list(dict.fromkeys(paths))
-    if not name or not paths or kind not in ("filme", "serien", "sonstiges"):
+    if not name or not paths or kind not in ("filme", "serien", "sonstiges", "musik"):
         raise HTTPException(400, "Name, mindestens einen Ordner und die Art angeben")
     for p in paths:
         if not os.path.isdir(p):
@@ -1048,8 +1182,8 @@ async def admin_lib_save(request: Request, u=Depends(admin_required)):
         if not old:
             raise HTTPException(404)
         old_paths = library.roots(old)
-        db.run("UPDATE libraries SET name=?, path=?, kind=?, sort=? WHERE id=?",
-               (name, paths[0], kind, int(b.get("sort") or 0), lid))
+        db.run("UPDATE libraries SET name=?, path=?, kind=?, admin_only=?, nav_end=? WHERE id=?",
+               (name, paths[0], kind, 1 if b.get("admin_only") else 0, 1 if b.get("nav_end") else 0, lid))
         for p in old_paths:
             if p not in paths:
                 db.run("DELETE FROM items WHERE library_id=? AND path LIKE ?", (lid, p.rstrip("/") + "/%"))
@@ -1057,24 +1191,378 @@ async def admin_lib_save(request: Request, u=Depends(admin_required)):
         for p in paths:
             db.run("INSERT OR IGNORE INTO library_paths(library_id,path) VALUES(?,?)", (lid, p))
         lib = db.q1("SELECT * FROM libraries WHERE id=?", (lid,))
-        if old["kind"] != kind:
+        if old["kind"] != kind and (old["kind"] == "musik" or kind == "musik"):
+            db.run("DELETE FROM items WHERE library_id=?", (lid,))
+            db.run("DELETE FROM tracks WHERE library_id=?", (lid,))
+        elif kind == "musik":
+            for p in old_paths:
+                if p not in paths:
+                    db.run("DELETE FROM tracks WHERE library_id=? AND path LIKE ?", (lid, p.rstrip("/") + "/%"))
+        elif old["kind"] != kind:
             await asyncio.to_thread(library.reclassify_library, lib)
         else:
             await asyncio.to_thread(library.refresh_folders, lib)
         db.run("DELETE FROM series WHERE library_id=? AND id NOT IN "
                "(SELECT DISTINCT series_id FROM items WHERE series_id IS NOT NULL)", (lid,))
     else:
-        lid = db.run("INSERT INTO libraries(name,path,kind,sort) VALUES(?,?,?,?)",
-                     (name, paths[0], kind, int(b.get("sort") or 0)))
+        lid = db.run("INSERT INTO libraries(name,path,kind,sort,admin_only,nav_end) VALUES(?,?,?,"
+                     "(SELECT IFNULL(MAX(sort),0)+1 FROM libraries),?,?)",
+                     (name, paths[0], kind, 1 if b.get("admin_only") else 0, 1 if b.get("nav_end") else 0))
         for p in paths:
             db.run("INSERT OR IGNORE INTO library_paths(library_id,path) VALUES(?,?)", (lid, p))
     library.scan_all()
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- Musik & Radio
+
+def music_libs(u):
+    allowed = set(allowed_libs(u))
+    return [r["id"] for r in db.q("SELECT id FROM libraries WHERE kind='musik'") if r["id"] in allowed]
+
+
+def _mlibs(u, lib):
+    libs = music_libs(u)
+    return [x for x in libs if x == lib] if lib else libs
+
+
+@app.get("/api/music/albums")
+def music_albums(q: str = "", sort: str = "album", lib: int = 0, artist: str = "", genre: str = "", cat: str = "",
+                 u=Depends(user_required)):
+    libs = _mlibs(u, lib)
+    out = {"albums": music.albums(libs, q.strip(), sort, artist, genre, cat)}
+    if q.strip():
+        out["tracks"] = music.search_tracks(libs, q.strip())
+    return out
+
+
+@app.get("/api/music/tracks")
+def music_tracks(q: str = "", sort: str = "title", lib: int = 0, artist: str = "", genre: str = "", cat: str = "",
+                 shuffle: int = 0, limit: int = 2000, u=Depends(user_required)):
+    return music.tracks(_mlibs(u, lib), q.strip(), artist, genre, sort, bool(shuffle), max(1, min(limit, 5000)), cat)
+
+
+@app.get("/api/music/facets")
+def music_facets(lib: int = 0, cat: str = "", u=Depends(user_required)):
+    return music.facets(_mlibs(u, lib), cat)
+
+
+@app.get("/api/music/album/{tid}")
+def music_album(tid: int, u=Depends(user_required)):
+    a = music.album(tid, music_libs(u))
+    if not a:
+        raise HTTPException(404, "Album nicht gefunden")
+    return a
+
+
+MUSIC_MIME = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+              ".ogg": "audio/ogg", ".oga": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav", ".wma": "audio/x-ms-wma"}
+
+
+@app.get("/api/music/stream/{tid}")
+async def music_stream(tid: int, mp3: int = 0, u=Depends(user_required)):
+    t = db.q1("SELECT * FROM tracks WHERE id=?", (tid,))
+    if not t or t["library_id"] not in music_libs(u):
+        raise HTTPException(404)
+    ext = os.path.splitext(t["path"])[1].lower()
+    if not mp3:
+        return FileResponse(t["path"], media_type=MUSIC_MIME.get(ext, "application/octet-stream"))
+    # Umwandeln für Geräte, die das Format nicht können
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-v", "error", "-i", t["path"], "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+
+    async def gen():
+        try:
+            while True:
+                chunk = await proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+    return StreamingResponse(gen(), media_type="audio/mpeg")
+
+
+@app.get("/api/music/playlists")
+def pl_list(u=Depends(user_required)):
+    return music.playlists(u["id"], music_libs(u))
+
+
+@app.post("/api/music/playlists")
+async def pl_create(request: Request, u=Depends(user_required)):
+    b = await request.json()
+    name = (b.get("name") or "").strip()
+    if not name:
+        raise HTTPException(400, "Bitte einen Namen angeben")
+    pid = db.run("INSERT INTO playlists(user_id,name,created) VALUES(?,?,?)", (u["id"], name[:100], time.time()))
+    if b.get("track_ids"):
+        music.playlist_add(pid, b["track_ids"])
+    return {"id": pid}
+
+
+def _pl_own(pid, u):
+    if not db.q1("SELECT 1 FROM playlists WHERE id=? AND user_id=?", (pid, u["id"])):
+        raise HTTPException(404, "Playlist nicht gefunden")
+
+
+@app.get("/api/music/playlists/{pid}")
+def pl_get(pid: int, u=Depends(user_required)):
+    p = music.playlist(pid, u["id"], music_libs(u))
+    if not p:
+        raise HTTPException(404, "Playlist nicht gefunden")
+    return p
+
+
+@app.post("/api/music/playlists/{pid}/add")
+async def pl_add(pid: int, request: Request, u=Depends(user_required)):
+    _pl_own(pid, u)
+    b = await request.json()
+    music.playlist_add(pid, b.get("track_ids") or [])
+    return {"ok": True}
+
+
+@app.put("/api/music/playlists/{pid}")
+async def pl_update(pid: int, request: Request, u=Depends(user_required)):
+    _pl_own(pid, u)
+    b = await request.json()
+    if b.get("name"):
+        db.run("UPDATE playlists SET name=? WHERE id=?", (b["name"].strip()[:100], pid))
+    if "track_ids" in b:
+        music.playlist_set(pid, b["track_ids"])
+    return {"ok": True}
+
+
+@app.delete("/api/music/playlists/{pid}")
+def pl_delete(pid: int, u=Depends(user_required)):
+    _pl_own(pid, u)
+    db.run("DELETE FROM playlist_items WHERE playlist_id=?", (pid,))
+    db.run("DELETE FROM playlists WHERE id=?", (pid,))
+    return {"ok": True}
+
+
+@app.get("/api/radio/stations")
+async def radio_stations(u=Depends(user_required)):
+    lst = await asyncio.to_thread(music.stations)
+    return [dict(s, idx=i) for i, s in enumerate(lst)]
+
+
+@app.get("/api/radio/search")
+async def radio_search(q: str, country: str = "", u=Depends(admin_required)):
+    try:
+        return await asyncio.to_thread(music.radio_search, q, country)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.put("/api/admin/radio")
+async def radio_save(request: Request, u=Depends(admin_required)):
+    return music.save_stations(await request.json())
+
+
+@app.get("/api/radio/play/{idx}")
+async def radio_play(idx: int, u=Depends(user_required)):
+    lst = await asyncio.to_thread(music.stations)
+    if idx < 0 or idx >= len(lst):
+        raise HTTPException(404)
+    url = await asyncio.to_thread(music.resolve_playlist, lst[idx]["url"])
+    client = httpx.AsyncClient(timeout=httpx.Timeout(15, read=60), follow_redirects=True, headers=music.UA)
+    try:
+        req = client.build_request("GET", url)
+        resp = await client.send(req, stream=True)
+        resp.raise_for_status()
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(502, f"Sender nicht erreichbar: {e}")
+
+    async def gen():
+        try:
+            async for chunk in resp.aiter_raw(16384):
+                yield chunk
+        finally:
+            await resp.aclose()
+            await client.aclose()
+    ctype = resp.headers.get("content-type", "audio/mpeg").split(";")[0]
+    if "html" in ctype or "text" in ctype:
+        ctype = "audio/mpeg"
+    return StreamingResponse(gen(), media_type=ctype, headers={"Cache-Control": "no-cache"})
+
+
+# ---------------------------------------------------------------- Fernsteuerung (z. B. aus Home Assistant)
+
+REMOTE = {"client": None, "user": None, "seen": 0, "queue": [], "event": None}
+
+
+def remote_key():
+    k = db.get_setting("remote_key")
+    if not k:
+        import secrets as _sec
+        k = _sec.token_urlsafe(24)
+        db.set_setting("remote_key", k)
+    return k
+
+
+@app.post("/api/remote/arm")
+async def remote_arm(request: Request, u=Depends(user_required)):
+    b = await request.json()
+    REMOTE.update(client=b.get("client"), user=u["id"], seen=time.time(), queue=[])
+    return {"ok": True}
+
+
+@app.post("/api/remote/disarm")
+async def remote_disarm(request: Request, u=Depends(user_required)):
+    b = await request.json()
+    if REMOTE["client"] == b.get("client"):
+        REMOTE.update(client=None, user=None, queue=[])
+    return {"ok": True}
+
+
+@app.get("/api/remote/poll")
+async def remote_poll(client: str, u=Depends(user_required)):
+    if REMOTE["client"] != client:
+        return {"armed": False, "commands": []}
+    REMOTE["seen"] = time.time()
+    if not REMOTE["queue"]:
+        ev = REMOTE["event"] = asyncio.Event()
+        try:
+            await asyncio.wait_for(ev.wait(), 25)
+        except asyncio.TimeoutError:
+            pass
+    REMOTE["seen"] = time.time()
+    cmds, REMOTE["queue"] = REMOTE["queue"], []
+    return {"armed": REMOTE["client"] == client, "commands": cmds}
+
+
+def _remote_resolve(action, query, user):
+    libs = music_libs(user)
+    q = (query or "").strip()
+    if action == "radio":
+        st = music.stations()
+        ql = _re.sub(r"[^a-z0-9äöüß]", "", q.lower())
+        best = None
+        for i, x in enumerate(st):
+            n = _re.sub(r"[^a-z0-9äöüß]", "", x["name"].lower())
+            score = 3 if n == ql else 2 if n.startswith(ql) else 1 if ql in n else 0
+            if not score and ql:
+                words = [_re.sub(r"[^a-z0-9äöüß]", "", w) for w in q.lower().split() if len(w) > 1]
+                score = 0.5 if words and all(w in n for w in words) else 0
+            if score and (not best or score > best[0]):
+                best = (score, i, x)
+        if not best:
+            return None, f"Keinen Sender „{q}“ gefunden"
+        return {"action": "radio", "idx": best[1], "station": dict(best[2], idx=best[1])}, f"Radio {best[2]['name']}"
+    if action == "play":
+        if not q or q.lower() in ("alles", "musik", "irgendwas", "zufall", "egal"):
+            lst = music.tracks(libs, shuffle=True, limit=300)
+            return ({"action": "play", "tracks": lst, "label": "Zufallswiedergabe"} if lst else None), "Zufallswiedergabe"
+        ql = q.lower()
+        ql2 = _re.sub(r"^(die |meine )?playlist ", "", ql)
+        for p in db.q("SELECT id,name FROM playlists WHERE user_id=?", (user["id"],)):
+            if p["name"].lower() == ql2 or (ql.startswith("playlist") and ql2 in p["name"].lower()):
+                pl = music.playlist(p["id"], user["id"], libs)
+                if pl and pl["tracks"]:
+                    return {"action": "play", "tracks": pl["tracks"], "label": pl["name"]}, f"Playlist {pl['name']}"
+        fac = music.facets(libs)
+        art = next((a["name"] for a in fac["artists"] if a["name"].lower() == ql), None) or \
+            next((a["name"] for a in fac["artists"] if ql in a["name"].lower()), None)
+        if art:
+            lst = music.tracks(libs, artist=art, shuffle=True, limit=300)
+            return {"action": "play", "tracks": lst, "label": art}, f"{len(lst)} Titel von {art}"
+        plur = {"hörbücher": "hörbuch", "hoerbuecher": "hörbuch", "hörspiele": "hörspiel", "podcasts": "podcast", "kinderlieder": "kinder"}
+        cat = next((c["name"] for c in fac["cats"] if c["name"].lower() == plur.get(ql, ql)), None)
+        if cat and cat != "Musik":
+            lst = music.tracks(libs, cat=cat, shuffle=True, limit=300)
+            return {"action": "play", "tracks": lst, "label": cat}, f"{len(lst)} Titel {cat}"
+        gen = next((g["name"] for g in fac["genres"] if g["name"].lower() == ql), None)
+        if gen:
+            lst = music.tracks(libs, genre=gen, shuffle=True, limit=300)
+            return {"action": "play", "tracks": lst, "label": gen}, f"{len(lst)} Titel {gen}"
+        al = music.albums(libs, q=q)
+        al = [a for a in al if ql in a["album"].lower()] or []
+        if al:
+            a = music.album(al[0]["id"], libs)
+            lst = [dict(t, cover=t["cover"] or a["cover"]) for t in a["tracks"]]
+            return {"action": "play", "tracks": lst, "label": a["album"]}, f"Album {a['album']}"
+        lst = music.tracks(libs, q=q, limit=300)
+        if lst:
+            return {"action": "play", "tracks": lst, "label": q}, f"{len(lst)} Titel zu „{q}“"
+        return None, f"Nichts gefunden zu „{q}“"
+    if action in ("pause", "resume", "next", "prev", "stop", "louder", "quieter"):
+        return {"action": action}, {"pause": "Pause", "resume": "Weiter", "next": "Nächster Titel", "prev": "Voriger Titel",
+                                    "stop": "Stopp", "louder": "Lauter", "quieter": "Leiser"}[action]
+    return None, "Unbekannter Befehl"
+
+
+@app.post("/api/remote/command")
+async def remote_command(request: Request):
+    key = request.headers.get("x-mediathek-key") or request.query_params.get("key")
+    if is_remote(request) and key != remote_key():   # aus dem Heimnetz (z. B. Home Assistant) ohne Schlüssel erlaubt
+        raise HTTPException(401, "Falscher Schlüssel")
+    b = await request.json()
+    if str(b.get("action", "")).lower().strip() == "inventar":     # Alben-/Genre-Übersicht, steuert nichts
+        libs = [r["id"] for r in db.q("SELECT id FROM libraries WHERE kind='musik'")]
+        txt = await asyncio.to_thread(music.inventory, libs)
+        return {"ok": True, "message": f"{len(txt.splitlines())} Alben", "inventar": txt}
+    if str(b.get("action", "")).lower().strip() == "dateien":       # alle Dateien der Musik-Ordner (für die Aufräum-Prüfung)
+        def walk():
+            out = []
+            for lib in db.q("SELECT * FROM libraries WHERE kind='musik'"):
+                for root in library.roots(lib):
+                    for dp, dns, fns in os.walk(root):
+                        dns[:] = [d for d in dns if d not in ("#recycle", "@eaDir", library.TRASH_DIR)]
+                        rel = os.path.relpath(dp, os.path.dirname(root))
+                        if not fns and not dns:
+                            out.append(f"{rel}/\t0")
+                        for f in fns:
+                            try:
+                                sz = os.path.getsize(os.path.join(dp, f))
+                            except OSError:
+                                sz = -1
+                            out.append(f"{rel}/{f}\t{sz}")
+            return out
+        lst = await asyncio.to_thread(walk)
+        return {"ok": True, "message": f"{len(lst)} Dateien", "dateien": "\n".join(lst)}
+    if not REMOTE["client"] or time.time() - REMOTE["seen"] > 90:
+        return JSONResponse({"ok": False, "message": "Kein Gerät bereit – in der Mediathek erst „Fernsteuerung“ antippen"}, 409)
+    user = db.q1("SELECT * FROM users WHERE id=?", (REMOTE["user"],))
+    action = {"spiele": "play", "play": "play", "radio": "radio", "pause": "pause", "stopp": "stop", "stop": "stop",
+              "weiter": "resume", "fortsetzen": "resume", "resume": "resume", "next": "next", "naechster": "next",
+              "nächster": "next", "zurueck": "prev", "zurück": "prev", "prev": "prev", "lauter": "louder",
+              "leiser": "quieter", "louder": "louder", "quieter": "quieter"}.get(str(b.get("action", "")).lower().strip())
+    if not action:
+        raise HTTPException(400, "Unbekannter Befehl")
+    cmd, msg = await asyncio.to_thread(_remote_resolve, action, b.get("query", ""), user)
+    if not cmd:
+        return JSONResponse({"ok": False, "message": msg}, 404)
+    REMOTE["queue"].append(cmd)
+    if REMOTE["event"]:
+        REMOTE["event"].set()
+    return {"ok": True, "message": msg}
+
+
+@app.get("/api/admin/remote")
+def remote_info(u=Depends(admin_required)):
+    return {"key": remote_key(), "armed": bool(REMOTE["client"]) and time.time() - REMOTE["seen"] < 90}
+
+
+@app.post("/api/admin/trash/{item_id}")
+async def admin_trash(item_id: int, u=Depends(admin_required)):
+    it = db.q1("SELECT * FROM items WHERE id=?", (item_id,))
+    if not it:
+        raise HTTPException(404, "Titel nicht gefunden")
+    try:
+        moved = await asyncio.to_thread(library.move_to_trash, it)
+    except Exception as e:
+        raise HTTPException(409, str(e))
+    left = bool(it["series_id"] and db.q1("SELECT 1 FROM series WHERE id=?", (it["series_id"],)))
+    return {"ok": True, "moved": moved, "series_left": left}
+
+
 @app.delete("/api/admin/libraries/{lib_id}")
 def admin_lib_delete(lib_id: int, u=Depends(admin_required)):
     db.run("DELETE FROM items WHERE library_id=?", (lib_id,))
+    db.run("DELETE FROM tracks WHERE library_id=?", (lib_id,))
     db.run("DELETE FROM series WHERE library_id=?", (lib_id,))
     db.run("DELETE FROM library_paths WHERE library_id=?", (lib_id,))
     db.run("DELETE FROM libraries WHERE id=?", (lib_id,))
@@ -1228,7 +1716,66 @@ async def admin_match(request: Request, u=Depends(admin_required)):
         ok = await asyncio.to_thread(library.match_movie, int(b["item_id"]), "", None, int(b["tmdb_id"]))
         if ok:
             await asyncio.to_thread(library.movie_details, int(b["item_id"]), int(b["tmdb_id"]))
+            # andere Teile desselben Films gleich mit zuordnen
+            it1 = db.q1("SELECT * FROM items WHERE id=?", (int(b["item_id"]),))
+            if it1 and it1["part"] and it1["pgroup"]:
+                for sib in db.q("SELECT id, path FROM items WHERE library_id=? AND pgroup=? AND id<>? AND locked=0",
+                                (it1["library_id"], it1["pgroup"], it1["id"])):
+                    if os.path.dirname(sib["path"]) == os.path.dirname(it1["path"]):
+                        await asyncio.to_thread(library.match_movie, sib["id"], "", None, int(b["tmdb_id"]))
+                        await asyncio.to_thread(library.movie_details, sib["id"], int(b["tmdb_id"]))
     return {"ok": ok}
+
+
+@app.get("/api/admin/vsmeta_poster/{item_id}")
+def vsmeta_poster(item_id: int, u=Depends(admin_required)):
+    it = db.q1("SELECT path FROM items WHERE id=?", (item_id,))
+    m = vsmeta.read(it["path"]) if it else None
+    if not m or not m.get("poster"):
+        raise HTTPException(404)
+    return Response(m["poster"], media_type="image/png" if m["poster"][:4] == b"\x89PNG" else "image/jpeg")
+
+
+@app.get("/api/admin/backup")
+def backup_status(u=Depends(admin_required)):
+    return backup.status()
+
+
+@app.post("/api/admin/backup")
+async def backup_save(request: Request, u=Depends(admin_required)):
+    b = await request.json()
+    if "dir" in b:
+        d = (b.get("dir") or "").strip().rstrip("/")
+        if d:
+            if not os.path.isdir(d):
+                raise HTTPException(400, f"Ordner {d} nicht gefunden")
+            if os.path.basename(d) != backup.DIRNAME:
+                d = os.path.join(d, backup.DIRNAME)       # eigener Unterordner, damit nichts vermischt wird
+            try:
+                os.makedirs(d, exist_ok=True)
+                t = os.path.join(d, ".schreibtest")
+                open(t, "w").close()
+                os.remove(t)
+            except OSError as e:
+                raise HTTPException(400, f"In diesen Ordner kann nicht geschrieben werden: {e}")
+        db.set_setting("backup_dir", d)
+    if b.get("keep"):
+        db.set_setting("backup_keep", str(max(3, min(365, int(b["keep"])))))
+    if b.get("now"):
+        res = await asyncio.to_thread(backup.run, True)
+        return dict(backup.status(), message=res)
+    return backup.status()
+
+
+@app.get("/api/admin/find_id")
+async def admin_find_id(kind: str, src: str, id: str, u=Depends(admin_required)):
+    try:
+        r = await asyncio.to_thread(library.tmdb_find, kind, src, id)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    if not r:
+        raise HTTPException(404, "Mit dieser Nummer nichts gefunden")
+    return r
 
 
 @app.get("/api/admin/lookup")
@@ -1258,20 +1805,30 @@ def _cast_text(cast_json):
 
 @app.get("/api/admin/editdata/{kind}/{ref}")
 def admin_editdata(kind: str, ref: int, u=Depends(admin_required)):
+    files = []
     if kind == "series":
         r = db.q1("SELECT * FROM series WHERE id=?", (ref,))
         if not r:
             raise HTTPException(404)
         title = r["name"]
+        files = [r["name"]]
     else:
         r = db.q1("SELECT * FROM items WHERE id=?", (ref,))
         if not r:
             raise HTTPException(404)
         title = (r["ep_name"] or r["title"]) if r["kind"] == "episode" else r["title"]
+        files = [os.path.basename(r["path"])]
+        if r["kind"] == "movie":
+            files += [os.path.basename(x["path"]) for x in siblings(r) if x["id"] != r["id"]]
     cast, director = _cast_text(r["cast"])
-    return {"kind": kind, "type": r.get("kind", "series"), "title": title, "year": r["year"], "fsk": r["fsk"],
+    ids = {"tmdb": str(r["tmdb_id"] or "")}
+    if r["tmdb_id"] and (kind == "series" or r.get("kind") == "movie"):
+        ids.update(library.external_ids(kind, r["tmdb_id"]))
+    has_vs = kind != "series" and r.get("path") and bool(vsmeta.find(r["path"]) or vsmeta.side_image(r["path"]))
+    return {"ids": ids, "has_vsmeta": bool(has_vs), "kind": kind, "type": r.get("kind", "series"), "title": title, "year": r["year"], "fsk": r["fsk"],
             "genres": ", ".join(json.loads(r["genres"] or "[]")), "director": director, "cast": cast,
-            "overview": r["overview"] or "", "poster": r["poster"], "locked": bool(r["locked"])}
+            "overview": r["overview"] or "", "poster": r["poster"], "locked": bool(r["locked"]),
+            "files": list(dict.fromkeys(files))[:4]}
 
 
 def _person_id(name):
@@ -1299,7 +1856,12 @@ async def admin_edit(request: Request, u=Depends(admin_required)):
     cast_json = json.dumps({"cast": cast, "director": director}, ensure_ascii=False)
     overview = (b.get("overview") or "").strip() or None
     poster = None
-    if b.get("poster_url"):
+    if str(b.get("poster_url") or "").startswith("/api/admin/vsmeta_poster/"):
+        it_v = db.q1("SELECT path FROM items WHERE id=?", (int(b["poster_url"].rsplit("/", 1)[1]),))
+        m_v = vsmeta.read(it_v["path"]) if it_v else None
+        if m_v and m_v.get("poster"):
+            poster = _save_custom_image(kind, ref, m_v["poster"], "image/png" if m_v["poster"][:4] == b"\x89PNG" else "image/jpeg")
+    elif b.get("poster_url"):
         try:
             data, ctype = await asyncio.to_thread(lookup.download_image, b["poster_url"])
             poster = _save_custom_image(kind, ref, data, ctype)
@@ -1325,7 +1887,10 @@ async def admin_edit(request: Request, u=Depends(admin_required)):
         db.run("UPDATE items SET ep_name=?, overview=?, locked=1" + (", poster=?" if poster else "") + " WHERE id=?",
                (title, overview, *([poster] if poster else []), ref))
         return {"ok": True}
-    for x in siblings(it):
+    targets = {x["id"]: x for x in siblings(it)}
+    for pt in part_list(it):                      # mehrteiliger Film: alle Teile bekommen dieselben Angaben
+        targets.setdefault(pt["id"], pt)
+    for x in targets.values():
         db.run("UPDATE items SET title=?, sort_title=?, year=?, fsk=?, genres=?, cast=?, overview=?, locked=1, "
                "meta_done=1, details_done=1" + (", poster=?" if poster else "") + " WHERE id=?",
                (title, library.sort_key(title), year, fsk, json.dumps(genres, ensure_ascii=False), cast_json,
@@ -1451,6 +2016,7 @@ def index():
 
 
 app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
+
 
 # Jellyfin-kompatible Schnittstelle für Apps wie Plezy (Apple TV)
 from . import jellyfin  # noqa: E402

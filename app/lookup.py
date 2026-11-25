@@ -7,7 +7,7 @@ import httpx
 
 from . import db, library
 
-UA = {"User-Agent": "Kinowerk/1.0 (private Heim-Mediathek)"}
+UA = {"User-Agent": "Kinowerk/1.1 (private Heim-Mediathek)"}
 
 GENRE_DE = {
     "Action": "Action", "Adventure": "Abenteuer", "Animation": "Animation", "Biography": "Biografie",
@@ -67,7 +67,68 @@ def search(provider, kind, q):
             return out
         if provider == "tmdb":
             return library.tmdb_search(kind, q)
+        if provider == "kfw":
+            return _kfw_search(c, q)
     raise RuntimeError("Unbekannte Quelle")
+
+
+# ---------------------------------------------------------------- KinoFilmWelt (Kinder- und Jugendfilmzentrum)
+
+KFW = "https://www.kinofilmwelt.de"
+
+
+def _kfw_query(c, q):
+    r = c.post(KFW + "/filmsuche/suchergebnisse", files={"suche": (None, q)})
+    r.raise_for_status()
+    out = []
+    for slug, img, title in re.findall(r'<a href="/filme/details/([^"]+)"\s*>\s*<img src="([^"]*)".*?<h2>(.*?)</h2>', r.text, re.S):
+        out.append({"id": slug, "title": _strip(title), "year": "", "info": "", "poster": img or None})
+    return out
+
+
+def _kfw_search(c, q):
+    """Die Suche dort findet nur zusammenhängende Wortfolgen – daher mehrere Varianten probieren."""
+    q = re.sub(r"\s*[\(\[]?(19|20)\d{2}[\)\]]?\s*$", "", q.strip())
+    tries = [q, q.replace(":", " -"), q.split(" - ")[0], q.split(":")[0], " ".join(q.split()[:2])]
+    seen, out = set(), []
+    for t in tries:
+        t = t.strip()
+        if len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        for x in _kfw_query(c, t):
+            if x["id"] not in {o["id"] for o in out}:
+                out.append(x)
+        if len(out) >= 3:
+            break
+    from .check import score
+    out.sort(key=lambda x: -score(x["title"], q))
+    return out[:15]
+
+
+def _kfw_details(c, slug):
+    r = c.get(f"{KFW}/filme/details/{slug}")
+    r.raise_for_status()
+    h = r.text
+    title = _strip((re.search(r"<h1>(.*?)</h1>", h, re.S) or [None, slug])[1])
+    info = {_strip(k).lower(): _strip(v) for k, v in
+            re.findall(r'<div class="col-xs-4 titel">(.*?):?\s*</div>\s*<div class="col-xs-8">(.*?)</div>', h, re.S)}
+    m = re.search(r'<div class="row filmtext">\s*<div class="col-sm-12">(.*?)</div>', h, re.S)
+    text = m.group(1) if m else ""
+    plot = _strip(re.split(r"<br\s*/?>\s*<br\s*/?>", text)[0]) if text else ""
+    fsk = None
+    f = info.get("fsk-freigabe", "")
+    if re.search(r"ohne|frei", f, re.I):
+        fsk = 0
+    else:
+        mf = re.search(r"(\d+)", f)
+        fsk = int(mf.group(1)) if mf and int(mf.group(1)) in (0, 6, 12, 16, 18) else None
+    img = re.search(r'<figure[^>]*>\s*<img src="([^"]+)"', h)
+    split = lambda s: [x.strip() for x in re.split(r"\s*,\s*", s or "") if x.strip()]
+    return {"title": title, "year": _year(info.get("land", "")), "overview": plot[:6000], "fsk": fsk,
+            "genres": split(info.get("genre")), "director": split(info.get("regie")),
+            "cast": [{"name": n, "role": ""} for n in split(info.get("darsteller"))][:40],
+            "poster_url": img.group(1) if img else None, "source": "KinoFilmWelt"}
 
 
 def _omdb_search(c, kind, q):
@@ -183,6 +244,13 @@ def parse_cast_text(text):
 def details(provider, kind, ident):
     """Einheitliches Ergebnis: title, year, overview, genres[], director[], cast[{name,role}], poster_url."""
     with _client() as c:
+        if provider == "kfw":
+            return _kfw_details(c, str(ident))
+        if provider == "tmdbtv":
+            return library.tmdb_tv_details(ident)
+        if provider == "vsmeta":
+            from . import vsmeta
+            return vsmeta.form_data(int(ident))
         if provider == "wiki":
             title = str(ident)
             r = c.get("https://de.wikipedia.org/api/rest_v1/page/summary/" + title.replace(" ", "_"))

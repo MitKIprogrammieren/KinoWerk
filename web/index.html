@@ -12,7 +12,7 @@
 <link rel="manifest" href="/web/manifest.json">
 <link rel="icon" href="/web/icon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/web/icon-180.png">
-<link rel="stylesheet" href="/web/style.css?v=20">
+<link rel="stylesheet" href="/web/style.css?v=42">
 </head>
 <body>
 <header id="top" hidden>
@@ -65,7 +65,9 @@
       </div>
     </div>
   </div>
-  <div id="p-nextbox" hidden><div><b>Folge zu Ende.</b> Als Nächstes:</div><div id="p-nexttitle"></div>
+  <div id="p-sleepbox" hidden><div>⏾ <b>Live-TV wird in <span id="p-sleepcount">5:00</span> beendet.</b></div>
+    <div class="row"><button id="p-sleep30" class="btn primary f">+30 Min</button><button id="p-sleep60" class="btn f">+60 Min</button><button id="p-sleepoff" class="btn f">Jetzt beenden</button></div></div>
+  <div id="p-nextbox" hidden><div id="p-nexthead"><b>Folge zu Ende.</b> Als Nächstes:</div><div id="p-nexttitle"></div>
     <div class="row"><button id="p-nextnow" class="btn primary f">▶ Nächste Folge</button><button id="p-nextcancel" class="btn f">Hier bleiben</button></div>
     <div class="small muted" style="margin-top:8px">Eingeschlafen? Einfach zurückspulen und weiterschauen.</div></div>
 </div>
@@ -95,6 +97,20 @@
 <div id="castbar" hidden><span id="cb-text">📺</span><button class="pbtn f" id="cb-play">❚❚</button><button class="btn sm primary f" id="cb-open">Fernbedienung</button></div>
 
 <div id="modal" hidden><div class="modal-box"><div id="modal-body"></div></div></div>
+<audio id="maudio" preload="auto"></audio>
+<div id="mini" hidden>
+  <div id="m-cover" class="m-cover"></div>
+  <div class="m-info"><div id="m-title"></div><div id="m-sub"></div></div>
+  <div class="m-ctrl"><button id="m-prev" class="pbtn f" title="Zurück">⏮</button><button id="m-play" class="pbtn f m-big" title="Wiedergabe/Pause">▶</button><button id="m-next" class="pbtn f" title="Weiter">⏭</button></div>
+  <div class="m-bar" id="m-barwrap"><span id="m-cur">0:00</span><input type="range" id="m-seek" min="0" max="1000" value="0" class="f"><span id="m-dur">0:00</span></div>
+  <button id="m-shuf" class="pbtn f" title="Zufallswiedergabe">🔀</button>
+  <div class="m-sleepwrap"><button id="m-sleep" class="pbtn f" title="Sleeptimer">⏾</button>
+    <div id="m-sleepmenu" hidden><div class="small muted">Ausschalten nach</div>
+      <button class="btn sm f" data-m="15">15 Min</button><button class="btn sm f" data-m="30">30 Min</button><button class="btn sm f" data-m="60">60 Min</button><button class="btn sm f" data-m="120">120 Min</button><button class="btn sm f" data-m="0">Aus</button></div></div>
+  <button id="m-close" class="pbtn f" title="Beenden">✕</button>
+  <div id="m-sleepbox" hidden><div>⏾ <b>Wiedergabe endet in <span id="m-sleepcount">5:00</span>.</b></div>
+    <div class="row"><button id="m-sl30" class="btn primary f">+30 Min</button><button id="m-sl60" class="btn f">+60 Min</button><button id="m-sloff" class="btn f">Jetzt beenden</button></div></div>
+</div>
 <div id="toast" hidden></div>
 
 <script>
@@ -110,8 +126,8 @@ window.onerror = function (msg, src, line) {
   }, 3000);
 };
 </script>
-<script src="/web/polyfills.js?v=20"></script>
+<script src="/web/polyfills.js?v=42"></script>
 <script src="/web/hls.min.js"></script>
-<script src="/web/app.js?v=20"></script>
+<script src="/web/app.js?v=42"></script>
 </body>
 </html>
